@@ -4,8 +4,8 @@ import {
   BASE_CHAPTERS,
   CHAPTER_WORDS,
   MAX_CHAPTERS,
+  MAX_CHUNK_ATTEMPTS,
   PLAN_BATCH,
-
   RULES_BLOCK,
   SYSTEM_PROMPT,
   WORDS_TARGET,
@@ -49,6 +49,7 @@ export async function buildPlan(args: {
     keyIndex: 0,
     temperature: 0.8,
     maxTokens: 2500,
+    minChars: 120,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       {
@@ -94,12 +95,13 @@ ${isLastSlice ? "आखिरी अध्याय का अंत खुल�
 जवाब सिर्फ इस जेसन में दो:
 {"chapters": [{"title": "अध्याय का हिंदी शीर्षक", "brief": "हिंदी में ब्यौरा"}]}`;
 
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const raw = await chat({
-            keyIndex: b,
+            keyIndex: b + attempt,
             temperature: 0.85,
             maxTokens: 4000,
+            minChars: 150,
             messages: [
               { role: "system", content: SYSTEM_PROMPT },
               { role: "user", content: ask },
@@ -124,8 +126,10 @@ ${isLastSlice ? "आखिरी अध्याय का अंत खुल�
   const chapters = slices.flat();
   if (chapters.length < 6) throw new Error("plan too short");
 
+  let filler = 0;
   while (chapters.length < BASE_CHAPTERS) {
-    const src = chapters[chapters.length % chapters.length]!;
+    const src = chapters[filler % chapters.length]!;
+    filler += 1;
     chapters.push({
       title: src.title,
       brief: src.brief + " इस हिस्से में कहानी और गहरी होती है और नया मोड़ आता है।",
@@ -134,7 +138,6 @@ ${isLastSlice ? "आखिरी अध्याय का अंत खुल�
 
   return { title, chapters: chapters.slice(0, BASE_CHAPTERS) };
 }
-
 
 export async function planAndSeedPart(partId: string) {
   const db = getPublicDb();
@@ -200,18 +203,19 @@ export async function writeChunk(chunkId: string, keyIndex: number) {
   const { data: chunk } = await db.from("story_chunks").select("*").eq("id", chunkId).single();
   if (!chunk) throw new Error("chunk not found");
   if (chunk.status === "done" && chunk.content.length > 0) {
-    return { skipped: true, wordCount: chunk.word_count };
+    return { skipped: true, status: "done", wordCount: chunk.word_count };
   }
 
   const { data: part } = await db.from("story_parts").select("*").eq("id", chunk.part_id).single();
   if (!part) throw new Error("part not found");
-  const { data: story } = await db.from("stories").select("*").eq("id", part.story_id).single();
-  if (!story) throw new Error("story not found");
 
   const plan = (part.plan ?? {}) as { title?: string; chapters?: Chapter[] };
   const chapters = plan.chapters ?? [];
   const outline = chapters
-    .map((c, i) => `${i === chunk.chunk_index ? "अभी यही लिखना है" : "आगे पीछे"}: ${c.title} - ${c.brief}`)
+    .map(
+      (c, i) =>
+        `${i === chunk.chunk_index ? "अभी यही लिखना है" : "आगे पीछे"}: ${c.title} - ${c.brief}`,
+    )
     .slice(Math.max(0, chunk.chunk_index - 2), chunk.chunk_index + 3)
     .join("\n");
 
@@ -227,16 +231,9 @@ export async function writeChunk(chunkId: string, keyIndex: number) {
   }
 
   const isLast = chunk.chunk_index === chapters.length - 1;
+  const attempts = (chunk.attempts ?? 0) + 1;
 
-  const raw = await chat({
-    keyIndex,
-    temperature: 0.92,
-    maxTokens: 7000,
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `कहानी का नाम: ${plan.title ?? part.title}
+  const prompt = `कहानी का नाम: ${plan.title ?? part.title}
 यह कहानी का भाग ${part.part_number} है।
 
 आसपास के अध्यायों का प्लान:
@@ -247,35 +244,65 @@ ${previousTail ? `पिछले हिस्से का आखिरी अ�
 इस अध्याय में यह होना है: ${chunk.brief}
 
 ध्यान रखो:
-- कम से कम ${CHAPTER_WORDS} हिंदी शब्द लिखो। छोटा मत लिखो।
+- लगभग ${CHAPTER_WORDS} हिंदी शब्द लिखो। इससे छोटा मत लिखो।
 - खूब सारे नेचुरल संवाद डालो, हर किरदार अपने अंदाज़ में बोले।
 - माहौल, चेहरे के भाव, आवाज़, डर, हँसी, दर्द सब दिखाओ।
+- वर्तनी और मात्राएँ जाँच कर लिखो, व्याकरण की एक भी गलती नहीं।
 - अध्याय के आखिर में एक हुक छोड़ो जिससे आगे पढ़ने का मन करे।
 ${isLast ? "- यह आखिरी अध्याय है, इसका अंत खुला रखना है। कोई पूरा समाधान मत दो।" : ""}
 
 नियम दोबारा याद रखो:
 ${RULES_BLOCK}
 
-सिर्फ कहानी लिखो, कोई शीर्षक या नोट नहीं।`,
-      },
-    ],
-  });
+सिर्फ कहानी लिखो, कोई शीर्षक या नोट नहीं। सोचना मत, सीधे कहानी शुरू करो।`;
 
-  const content = sanitizeStoryText(raw);
-  const wordCount = countWords(content);
-  if (wordCount < 120) throw new Error("chunk too short");
+  try {
+    const raw = await chat({
+      keyIndex,
+      temperature: 0.92,
+      maxTokens: 3600,
+      // Roughly the character count of the asked-for chapter length; the helper
+      // retries on another key when the model returns far less than this.
+      minChars: Math.round(CHAPTER_WORDS * 4.2),
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: prompt },
+      ],
+    });
 
-  await db
-    .from("story_chunks")
-    .update({
-      content,
-      word_count: wordCount,
-      status: "done",
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", chunkId);
+    const content = sanitizeStoryText(raw);
+    const wordCount = countWords(content);
+    if (wordCount < 150) throw new Error(`chunk too short (${wordCount} words)`);
 
-  return { skipped: false, wordCount };
+    await db
+      .from("story_chunks")
+      .update({
+        content,
+        word_count: wordCount,
+        status: "done",
+        attempts,
+        error: "",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", chunkId);
+
+    return { skipped: false, status: "done", wordCount };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Never loop forever on one bad chapter: after a few tries it is parked as
+    // skipped and the rest of the story keeps moving.
+    const status = attempts >= MAX_CHUNK_ATTEMPTS ? "skipped" : "pending";
+    await db
+      .from("story_chunks")
+      .update({
+        attempts,
+        status,
+        error: message.slice(0, 400),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", chunkId);
+    return { skipped: false, status, wordCount: 0, error: message };
+  }
 }
 
 export async function finalizePart(partId: string) {
@@ -286,7 +313,7 @@ export async function finalizePart(partId: string) {
     .eq("part_id", partId)
     .order("chunk_index");
   const list = chunks ?? [];
-  const pending = list.filter((c) => c.status !== "done");
+  const pending = list.filter((c) => c.status === "pending");
   const total = list.reduce((sum, c) => sum + c.word_count, 0);
 
   if (pending.length > 0) {
@@ -324,10 +351,17 @@ export async function finalizePart(partId: string) {
     .from("story_parts")
     .update({ word_count: total, status: "complete", updated_at: new Date().toISOString() })
     .eq("id", partId);
-  await db
-    .from("stories")
-    .update({ updated_at: new Date().toISOString() })
-    .eq("id", (await db.from("story_parts").select("story_id").eq("id", partId).single()).data!.story_id);
+  const { data: owner } = await db
+    .from("story_parts")
+    .select("story_id")
+    .eq("id", partId)
+    .single();
+  if (owner) {
+    await db
+      .from("stories")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", owner.story_id);
+  }
 
   return { status: "complete", wordCount: total, pending: 0 };
 }
